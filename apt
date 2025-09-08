@@ -1,0 +1,347 @@
+#!/system/bin/sh
+# 🦾 Balkava APT (bapt)
+# ========= CONFIG =========
+BAPT_HOME="/data/local/tmp/balkava_a/usr/bapt"
+if [ ! -d $BAPT_HOME ]; then
+mkdir "$BAPT_HOME"
+fi
+INSTALLED="$BAPT_HOME/installed"
+RECEIPTS="$BAPT_HOME/receipts"
+LOGS="$BAPT_HOME/logs"
+CONF="$BAPT_HOME/bapt.conf"
+
+# Defaults (override via $CONF)
+GH_USER="blankblank-2A"
+GH_REPO="balkava_repo"
+GH_BRANCH="main"
+PKG_DIR="packages"
+
+# ========= LOAD CONF =========
+[ -f "$CONF" ] && . "$CONF"
+
+# ========= UTIL =========
+mkdir -p "$INSTALLED" "$RECEIPTS" "$LOGS"
+
+dbg()  { echo "D: $*"; }
+warn() { echo "W: $*"; }
+err()  { echo "E: $*" 1>&2; }
+
+raw_base()  { echo "https://raw.githubusercontent.com/$GH_USER/$GH_REPO/$GH_BRANCH/$PKG_DIR"; }
+tree_url()  { echo "https://github.com/$GH_USER/$GH_REPO/tree/$GH_BRANCH/$PKG_DIR"; }
+
+_has() { command -v "$1" >/dev/null 2>&1; }
+
+_sha256() {
+  if _has sha256sum; then sha256sum "$1" | awk '{print $1}'
+  elif _has toybox; then toybox sha256sum "$1" | awk '{print $1}'
+  elif _has busybox && busybox sha256sum >/dev/null 2>&1; then busybox sha256sum "$1" | awk '{print $1}'
+  else echo "unknown"
+  fi
+}
+
+# ========= CORE =========
+bapt_help() {
+cat <<EOF
+bapt — Balkava package manager
+
+Usage:
+  bapt origin show
+  bapt origin set <user> <repo> [branch] [dir]
+  bapt list
+  bapt install <pkgName|pkgName.bpk>
+  bapt install-url <raw-url>
+  bapt remove <pkgName>
+  bapt info <pkgName>
+EOF
+}
+
+bapt_origin_show() {
+  echo "Origin:"
+  echo "  GH_USER   = $GH_USER"
+  echo "  GH_REPO   = $GH_REPO"
+  echo "  GH_BRANCH = $GH_BRANCH"
+  echo "  PKG_DIR   = $PKG_DIR"
+  echo "  TREE_URL  = $(tree_url)"
+  echo "  RAW_BASE  = $(raw_base)"
+  echo
+  echo "Config file: $CONF"
+}
+
+bapt_origin_set() {
+  [ -z "$1" ] && err "need <user> <repo> [branch] [dir]" && exit 2
+  GH_USER="$1"; GH_REPO="$2"; GH_BRANCH="${3:-main}"; PKG_DIR="${4:-packages}"
+  cat > "$CONF" <<EOF
+GH_USER="$GH_USER"
+GH_REPO="$GH_REPO"
+GH_BRANCH="$GH_BRANCH"
+PKG_DIR="$PKG_DIR"
+EOF
+  dbg "Origin updated and saved to $CONF"
+  bapt_origin_show
+}
+
+# Scrape GitHub tree page for .bpk filenames (no PCRE).
+# We split the HTML on quotes, keep hrefs to /blob/.../packages/*.bpk, strip path -> filename.
+_scrape_names() {
+  curl -fsSL "$(tree_url)" 2>/dev/null \
+    | tr '"' '\n' \
+    | grep "/$GH_USER/$GH_REPO/blob/$GH_BRANCH/$PKG_DIR/.*\.bpk" \
+    | sed "s#.*/$PKG_DIR/##" \
+    | sed 's/?plain=1//' \
+    | sed 's/#.*//' \
+    | sort -u
+}
+
+# ========= DEPENDENCY INSTALL =========
+_seen_deps=""
+
+_install_dep() {
+  DEP="$1"
+  dbg "Resolving dependency: $DEP"
+
+  # Prevent circular dependencies
+  case " $_seen_deps " in
+    *" $DEP "*) 
+      warn "Circular dependency detected: $DEP (skipping)"
+      return
+      ;;
+  esac
+  _seen_deps="$_seen_deps $DEP"
+
+  # Resolve dependencies if any
+  REQ_URL="$(raw_base)/$DEP.requires"
+  TMP_REQ=$(mktemp)
+  if wget --no-check-certificate -q -O "$TMP_REQ" "$REQ_URL"; then
+    while read dep_pkg; do
+      dep_pkg=$(echo "$dep_pkg" | tr -d ' \t\r\n')
+      [ -n "$dep_pkg" ] && _install_dep "$dep_pkg"
+    done < "$TMP_REQ"
+    rm -f "$TMP_REQ"
+  fi
+
+  # ==== Detect type ====
+  if echo "$DEP" | grep -qE '\.app$'; then
+    # Balkava App
+    APPNAME=$(basename "$DEP" .app)
+    URL="$(raw_base)/$DEP"
+    APP_DIR="/data/local/tmp/balkava_a/data/app/com.$APPNAME"
+    DATA_DIR="/data/local/tmp/balkava_a/data/data/com.$APPNAME"
+    OUT="$APP_DIR/$APPNAME.app"
+    LOG="$LOGS/$APPNAME-$(date +%s).log"
+    RECEIPT="$RECEIPTS/$APPNAME.receipt"
+
+    mkdir -p "$APP_DIR" "$DATA_DIR"
+
+    dbg "Downloading app $APPNAME from $URL"
+    if ! wget --no-check-certificate -q -O "$OUT" "$URL"; then
+      err "Failed to download: $URL"
+      return 1
+    fi
+
+    chmod 0755 "$OUT"
+    SUM=$(_sha256 "$OUT")
+    {
+      echo "name=$APPNAME"
+      echo "type=app"
+      echo "url=$URL"
+      echo "installed_at=$(date '+%Y-%m-%d %H:%M:%S')"
+      echo "sha256=$SUM"
+    } > "$RECEIPT"
+
+    dbg "Running postinstall -> sh $OUT"
+    ( sh "$OUT" ) >"$LOG" 2>&1 || warn "postinstall returned non-zero (see $LOG)"
+
+    echo "✅ Installed App: $APPNAME"
+    echo "   sha256: $SUM"
+    echo "   log: $LOG"
+
+  else
+    # ==== Regular .bpk package ====
+    PKG="$DEP"
+    URL="$(raw_base)/$PKG.bpk"
+    OUT="$INSTALLED/$PKG.bpk"
+    LOG="$LOGS/$PKG-$(date +%s).log"
+    RECEIPT="$RECEIPTS/$PKG.receipt"
+
+    # If installed, check for upgrade
+    if [ -f "$RECEIPT" ]; then
+      OLD_HASH=$(grep '^sha256=' "$RECEIPT" | cut -d= -f2)
+      TMP=$(mktemp)
+      if wget --no-check-certificate -q -O "$TMP" "$URL"; then
+        NEW_HASH=$(_sha256 "$TMP")
+        if [ "$NEW_HASH" = "$OLD_HASH" ]; then
+          dbg "Package $PKG already up-to-date"
+          rm -f "$TMP"
+          return
+        else
+          warn "Package $PKG changed, upgrading..."
+          mv "$TMP" "$OUT"
+        fi
+      else
+        err "Failed to check upgrade for $PKG"
+        rm -f "$TMP"
+        return 1
+      fi
+    else
+      dbg "Downloading $PKG from $URL"
+      if ! wget --no-check-certificate -q -O "$OUT" "$URL"; then
+        err "Failed to download: $URL"
+        return 1
+      fi
+    fi
+
+    chmod 0755 "$OUT"
+    SUM=$(_sha256 "$OUT")
+    {
+      echo "name=$PKG"
+      echo "url=$URL"
+      echo "installed_at=$(date '+%Y-%m-%d %H:%M:%S')"
+      echo "sha256=$SUM"
+    } > "$RECEIPT"
+
+    dbg "Running postinstall -> sh $OUT"
+    ( sh "$OUT" ) >"$LOG" 2>&1 || warn "postinstall returned non-zero (see $LOG)"
+
+    mv "$OUT" /data/local/tmp/balkava_a/bin/installed/"$PKG" 2>/dev/null || true
+    echo "✅ Installed/Upgraded: $PKG"
+    echo "   sha256: $SUM"
+    echo "   log: $LOG"
+  fi
+}
+# ========= INSTALL MULTIPLE / SINGLE =========
+bapt_install() {
+  [ $# -eq 0 ] && err "Usage: bapt install <pkgName|pkgName.bpk> [pkg2 ...]" && exit 2
+  for ARG in "$@"; do
+    PKG="$(_norm_pkg_name "$ARG")"
+    _install_dep "$PKG"
+  done
+}
+bapt_search() {
+  [ -z "$1" ] && err "Usage: bapt search <term>" && exit 2
+  TERM="$1"
+  dbg "Searching for '$TERM' in GitHub repo..."
+  _scrape_names | grep -i "$TERM" || echo "No matches for '$TERM'"
+}
+
+_norm_pkg_name() {  # strip .bpk if provided
+  echo "$1" | sed 's/\.bpk$//'
+}
+
+bapt_remove() {
+  [ -z "$1" ] && err "Usage: bapt remove <pkgName>" && exit 2
+  PKG="$(_norm_pkg_name "$1")"
+  FILE="$INSTALLED/$PKG.bpk"
+  REC="$RECEIPTS/$PKG.receipt"
+
+  if [ ! -f "$FILE" ]; then
+    err "$PKG is not installed."
+    exit 1
+  fi
+
+  rm -f "$FILE" "$REC"
+  echo "🗑️ Removed: $PKG"
+}
+
+bapt_info() {
+  [ -z "$1" ] && err "Usage: bapt info <pkgName>" && exit 2
+  PKG="$(_norm_pkg_name "$1")"
+  REC="$RECEIPTS/$PKG.receipt"
+  FILE="$INSTALLED/$PKG.bpk"
+
+  if [ -f "$REC" ]; then
+    echo "Installed package:"
+    cat "$REC"
+    [ -f "$FILE" ] && echo "size_bytes=$(wc -c < "$FILE")"
+    exit 0
+  fi
+
+  # Not installed: show remote info best-effort
+  URL="$(raw_base)/$PKG.bpk"
+  echo "Remote (not installed):"
+  echo "name=$PKG"
+  echo "url=$URL"
+  if _has curl; then
+    # try to get size via headers
+    SIZE=$(curl -I -s "$URL" | awk '/content-length/i {print $2}' | tr -d '\r')
+    [ -n "$SIZE" ] && echo "size_bytes=$SIZE"
+  fi
+}
+
+# ========= INSTALL MULTIPLE =========
+bapt_install_multi() {
+  if [ -z "$1" ]; then
+    err "Usage: bapt install-multi <pkg1> <pkg2> ... OR bapt install-multi -f <file>"
+    exit 2
+  fi
+
+  # Option: from file
+  if [ "$1" = "-f" ]; then
+    FILE="$2"
+    [ ! -f "$FILE" ] && err "File not found: $FILE" && exit 1
+    while read PKG; do
+      PKG=$(echo $PKG | tr -d ' \t\r\n')
+      [ -n "$PKG" ] && _install_dep "$PKG"
+    done < "$FILE"
+  else
+    # Space-separated packages
+    for PKG in "$@"; do
+      _install_dep "$PKG"
+    done
+  fi
+}
+bapt_install_url() {
+  [ $# -eq 0 ] && err "Usage: bapt install-url <raw-url1> [raw-url2 ...]" && exit 2
+
+  for URL in "$@"; do
+    PKG="$(basename "$URL" .bpk)"
+    OUT="$INSTALLED/$PKG.bpk"
+    LOG="$LOGS/$PKG-$(date +%s).log"
+
+    dbg "Downloading from raw URL: $URL"
+    if ! wget --no-check-certificate -q -O "$OUT" "$URL"; then
+      err "Failed to download: $URL"
+      continue
+    fi
+
+    chmod 0755 "$OUT"
+    SUM=$(_sha256 "$OUT")
+    {
+      echo "name=$PKG"
+      echo "url=$URL"
+      echo "installed_at=$(date '+%Y-%m-%d %H:%M:%S')"
+      echo "sha256=$SUM"
+    } > "$RECEIPTS/$PKG.receipt"
+
+    dbg "Running postinstall (if any) -> sh $OUT"
+    ( sh "$OUT" ) >"$LOG" 2>&1 || warn "postinstall returned non-zero (see $LOG)"
+
+    mv "$OUT" /data/local/tmp/balkava_a/bin/installed/"$PKG" 2>/dev/null || true
+
+    echo "✅ Installed: $PKG"
+    echo "   file: $OUT"
+    echo "   sha256: $SUM"
+    echo "   log: $LOG"
+  done
+}
+
+# ========= DISPATCH =========
+CMD="$1"; shift 2>/dev/null
+
+case "$CMD" in
+  origin)
+    SUB="$1"; shift 2>/dev/null
+    case "$SUB" in
+      show) bapt_origin_show ;;
+      set)  bapt_origin_set "$@" ;;
+      *)    err "usage: bapt origin {show|set <user> <repo> [branch] [dir]}" ; exit 2 ;;
+    esac
+    ;;
+  search)     bapt_search "$@" ;;
+  install)     bapt_install "$@" ;;
+  install-url) bapt_install_url "$@" ;;
+  remove)      bapt_remove "$@" ;;
+  info)        bapt_info "$@" ;;
+  ""|help|-h|--help) bapt_help ;;
+  install-multi) bapt_install_multi "$@" ;;
+  *) echo "unknown command: $CMD"; bapt_help; exit 2 ;;
+esac
