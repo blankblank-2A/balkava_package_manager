@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# 🦾 Balkava APT (bapt)
+# Balkava APT (bapt)
 # ========= CONFIG =========
 BAPT_HOME="/data/local/tmp/balkava_a/usr/bapt"
 if [ ! -d $BAPT_HOME ]; then
